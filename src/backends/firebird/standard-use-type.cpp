@@ -11,83 +11,23 @@
 #include "firebird/common.h"
 #include "soci/soci.h"
 
+using namespace Firebird;
 using namespace soci;
 using namespace soci::details;
 using namespace soci::details::firebird;
 
-void firebird_standard_use_type_backend::bind_by_pos(
-    int & position, void * data, exchange_type type, bool /* readOnly */)
-{
-    if (statement_.boundByName_)
-    {
-        throw soci_error(
-         "Binding for use elements must be either by position or by name.");
-    }
-
-    position_ = position-1;
-    data_ = data;
-    type_ = type;
-
-    ++position;
-
-    statement_.useType_ = eStandard;
-    statement_.uses_.push_back(static_cast<void*>(this));
-
-    XSQLVAR *var = statement_.sqlda2p_->sqlvar+position_;
-
-    buf_ = allocBuffer(var);
-    var->sqldata = buf_;
-    var->sqlind = &indISCHolder_;
-
-    statement_.boundByPos_ = true;
-}
-
-void firebird_standard_use_type_backend::bind_by_name(
-    std::string const & name, void * data,
-    exchange_type type, bool /* readOnly */)
-{
-    if (statement_.boundByPos_)
-    {
-        throw soci_error(
-         "Binding for use elements must be either by position or by name.");
-    }
-
-    std::map <std::string, int> :: iterator idx =
-        statement_.names_.find(name);
-
-    if (idx == statement_.names_.end())
-    {
-        throw soci_error("Missing use element for bind by name (" + name + ")");
-    }
-
-    position_ = idx->second;
-    data_ = data;
-    type_ = type;
-
-    statement_.useType_ = eStandard;
-    statement_.uses_.push_back(static_cast<void*>(this));
-
-    XSQLVAR *var = statement_.sqlda2p_->sqlvar+position_;
-
-    buf_ = allocBuffer(var);
-    var->sqldata = buf_;
-    var->sqlind = &indISCHolder_;
-
-    statement_.boundByName_ = true;
-}
-
 void firebird_standard_use_type_backend::pre_use(indicator const * ind)
 {
-    indISCHolder_ =  0;
+    *sqlnullptr_ =  0;
     if (ind)
     {
         switch (*ind)
         {
             case i_null:
-                indISCHolder_ = -1;
+                *sqlnullptr_ = -1;
                 break;
             case i_ok:
-                indISCHolder_ =  0;
+                *sqlnullptr_ =  0;
                 break;
             default:
                 throw soci_error("Unsupported indicator value.");
@@ -97,40 +37,34 @@ void firebird_standard_use_type_backend::pre_use(indicator const * ind)
 
 void firebird_standard_use_type_backend::exchangeData()
 {
-    XSQLVAR *var = statement_.sqlda2p_->sqlvar+position_;
-
-    if (0 != indISCHolder_)
-        return;
+    if( *sqlnullptr_ ) return;
 
     switch (type_)
     {
         case x_char:
-            setTextParam(&exchange_type_cast<x_char>(data_), 1, buf_, var);
+            setTextParam(&exchange_type_cast<x_char>(data_), 1, buf_, sqltype_, sqllen_, sqlscale_);
             break;
         case x_short:
-            to_isc<short>(data_, var);
+            to_isc<short>(data_, buf_, sqltype_, sqlscale_);
             break;
         case x_integer:
-            to_isc<int>(data_, var);
+            to_isc<int>(data_, buf_, sqltype_, sqlscale_);
             break;
         case x_long_long:
-            to_isc<long long>(data_, var);
-            break;
-        case x_unsigned_long_long:
-            to_isc<unsigned long long>(data_, var);
+            to_isc<long long>(data_, buf_, sqltype_, sqlscale_);
             break;
         case x_double:
-            to_isc<double>(data_, var);
+            to_isc<double>(data_, buf_, sqltype_, sqlscale_);
             break;
 
         case x_stdstring:
             {
                 std::string const& tmp = exchange_type_cast<x_stdstring>(data_);
-                setTextParam(tmp.c_str(), tmp.size(), buf_, var);
+                setTextParam(tmp.c_str(), tmp.size(), buf_, sqltype_, sqllen_, sqlscale_);
             }
             break;
         case x_stdtm:
-            tmEncode(var->sqltype, &exchange_type_cast<x_stdtm>(data_), buf_);
+            tmEncode(sqltype_, &exchange_type_cast<x_stdtm>(data_), buf_);
             break;
 
             // cases that require special handling
@@ -147,7 +81,7 @@ void firebird_standard_use_type_backend::exchangeData()
                 }
 
                 blob->save();
-                memcpy(buf_, &blob->bid_, var->sqllen);
+                memcpy(buf_, &blob->bid_, sizeof(blob->bid_));
             }
             break;
 
@@ -166,13 +100,11 @@ void firebird_standard_use_type_backend::exchangeData()
 
 void firebird_standard_use_type_backend::copy_to_blob(const std::string& in)
 {
-    if (blob_)
-        blob_->trim(0);
-    else
-        blob_ = new firebird_blob_backend(statement_.session_);
+    auto * blob_ = new firebird_blob_backend(statement_.session_);
     blob_->append(in.c_str(), in.length());
     blob_->save();
     memcpy(buf_, &blob_->bid_, sizeof(blob_->bid_));
+    delete blob_;
 }
 
 void firebird_standard_use_type_backend::post_use(
@@ -189,24 +121,4 @@ void firebird_standard_use_type_backend::post_use(
     //          and executed a query that attempted to modified it)
     // - false: the modification should be propagated to the given object.
     // ...
-}
-
-void firebird_standard_use_type_backend::clean_up()
-{
-    if (buf_ != NULL)
-    {
-        delete [] buf_;
-        buf_ = NULL;
-    }
-
-    if (blob_)
-    {
-        delete blob_;
-        blob_ = NULL;
-    }
-
-    std::vector<void*>::iterator it =
-        std::find(statement_.uses_.begin(), statement_.uses_.end(), this);
-    if (it != statement_.uses_.end())
-        statement_.uses_.erase(it);
 }

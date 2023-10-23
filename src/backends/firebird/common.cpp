@@ -9,13 +9,14 @@
 #include "firebird/common.h"
 #include "soci/soci-backend.h"
 #include "soci-compiler.h"
-#include <ibase.h> // FireBird
 #include <cstddef>
 #include <cstring>
 #include <cstdio>
 #include <sstream>
 #include <iostream>
 #include <string>
+
+using namespace Firebird;
 
 namespace soci
 {
@@ -26,30 +27,9 @@ namespace details
 namespace firebird
 {
 
-char * allocBuffer(XSQLVAR* var)
+void tmEncode(unsigned type, std::tm * src, void * dst)
 {
-    std::size_t size;
-    int type = var->sqltype & ~1;
-    if (type == SQL_VARYING)
-    {
-        size = var->sqllen + sizeof(short);
-    }
-    else if (type == SQL_TIMESTAMP || type == SQL_TYPE_TIME
-            || type == SQL_TYPE_DATE)
-    {
-        size = sizeof(std::tm);
-    }
-    else
-    {
-        size = var->sqllen;
-    }
-
-    return new char[size];
-}
-
-void tmEncode(short type, std::tm * src, void * dst)
-{
-    switch (type & ~1)
+    switch (type)
     {
         // In Interbase v6 DATE represents a date-only data type,
         // in InterBase v5 DATE represents a date+time data type.
@@ -69,9 +49,9 @@ void tmEncode(short type, std::tm * src, void * dst)
     }
 }
 
-void tmDecode(short type, void * src, std::tm * dst)
+void tmDecode(unsigned type, void * src, std::tm * dst)
 {
-    switch (type & ~1)
+    switch (type)
     {
     case SQL_TIMESTAMP:
         isc_decode_timestamp(static_cast<ISC_TIMESTAMP*>(src), dst);
@@ -89,49 +69,46 @@ void tmDecode(short type, void * src, std::tm * dst)
     }
 }
 
-void setTextParam(char const * s, std::size_t size, char * buf_,
-    XSQLVAR * var)
+void setTextParam(char const * s, std::size_t size, unsigned char * sqlbuf, unsigned sqltype, unsigned sqllen, int sqlscale)
 {
-    int const sqltype = var->sqltype & ~1;
-
     if (sqltype == SQL_VARYING || sqltype == SQL_TEXT)
     {
-        if (size > static_cast<std::size_t>(var->sqllen))
+        if (size > static_cast<std::size_t>(sqllen))
         {
             std::ostringstream msg;
             msg << "Value \"" << s << "\" is too long ("
                 << size << " bytes) to be stored in column of size "
-                << var->sqllen << " bytes";
+                << sqllen << " bytes";
             throw soci_error(msg.str());
         }
 
-        short const sz = static_cast<short>(size);
+        unsigned short const sz = static_cast<unsigned short>(size);
 
         if (sqltype == SQL_VARYING)
         {
-            std::memcpy(buf_, &sz, sizeof(short));
-            std::memcpy(buf_ + sizeof(short), s, sz);
+            std::memcpy(sqlbuf, &sz, sizeof(short));
+            std::memcpy(sqlbuf + sizeof(short), s, sz);
         }
         else // sqltype == SQL_TEXT
         {
-            std::memcpy(buf_, s, sz);
-            if (sz < var->sqllen)
+            std::memcpy(sqlbuf, s, sz);
+            if (sz < sqllen)
             {
-                std::memset(buf_+sz, ' ', var->sqllen - sz);
+                std::memset(sqlbuf+sz, ' ', sqllen - sz);
             }
         }
     }
     else if (sqltype == SQL_SHORT)
     {
-        parse_decimal<short, unsigned short>(buf_, var, s);
+        parse_decimal<short, unsigned short>(sqlscale, sqltype, sqlbuf, s);
     }
     else if (sqltype == SQL_LONG)
     {
-        parse_decimal<int, unsigned int>(buf_, var, s);
+        parse_decimal<int, unsigned int>(sqlscale, sqltype, sqlbuf, s);
     }
     else if (sqltype == SQL_INT64)
     {
-        parse_decimal<long long, unsigned long long>(buf_, var, s);
+        parse_decimal<long long, unsigned long long>(sqlscale, sqltype, sqlbuf, s);
     }
     else if (sqltype == SQL_TIMESTAMP
             || sqltype == SQL_TYPE_DATE)
@@ -151,15 +128,13 @@ void setTextParam(char const * s, std::size_t size, char * buf_,
             }
         }
         std::tm t;
-        std::memset(&t, 0, sizeof(t));
         t.tm_year = year - 1900;
         t.tm_mon = month - 1;
         t.tm_mday = day;
         t.tm_hour = hour;
         t.tm_min = min;
         t.tm_sec = sec;
-        std::memcpy(buf_, &t, sizeof(t));
-        tmEncode(var->sqltype, &t, buf_);
+        tmEncode(sqltype, &t, sqlbuf);
     }
     else if (sqltype == SQL_TYPE_TIME)
     {
@@ -169,12 +144,10 @@ void setTextParam(char const * s, std::size_t size, char * buf_,
             throw soci_error("Could not parse timestamp value.");
         }
         std::tm t;
-        std::memset(&t, 0, sizeof(t));
         t.tm_hour = hour;
         t.tm_min = min;
         t.tm_sec = sec;
-        std::memcpy(buf_, &t, sizeof(t));
-        tmEncode(var->sqltype, &t, buf_);
+        tmEncode(sqltype, &t, sqlbuf);
     }
     else
     {
@@ -182,65 +155,41 @@ void setTextParam(char const * s, std::size_t size, char * buf_,
     }
 }
 
-std::string getTextParam(XSQLVAR const *var)
+std::string getTextParam(unsigned char* sqlbuf, unsigned sqltype, unsigned sqllen, int sqlscale)
 {
-    //std::cerr << "getTextParam: var->sqltype=" << var->sqltype << std::endl;
     short size;
     std::size_t offset = 0;
 
-    if ((var->sqltype & ~1) == SQL_VARYING)
+    if (sqltype == SQL_VARYING)
     {
         GCC_WARNING_SUPPRESS(cast-align)
 
-        size = *reinterpret_cast<short*>(var->sqldata);
+        size = *reinterpret_cast<short*>(sqlbuf);
 
         GCC_WARNING_RESTORE(cast-align)
 
         offset = sizeof(short);
     }
-    else if ((var->sqltype & ~1) == SQL_TEXT)
+    else if (sqltype == SQL_TEXT)
     {
-        size = var->sqllen;
+        size = sqllen;
     }
-    else if ((var->sqltype & ~1) == SQL_SHORT)
+    else if (sqltype == SQL_SHORT)
     {
-        return format_decimal<short>(var->sqldata, var->sqlscale);
+        return format_decimal<short>(sqlbuf, sqlscale);
     }
-    else if ((var->sqltype & ~1) == SQL_LONG)
+    else if (sqltype == SQL_LONG)
     {
-        return format_decimal<int>(var->sqldata, var->sqlscale);
+        return format_decimal<int>(sqlbuf, sqlscale);
     }
-    else if ((var->sqltype & ~1) == SQL_INT64)
+    else if (sqltype == SQL_INT64)
     {
-        return format_decimal<long long>(var->sqldata, var->sqlscale);
+        return format_decimal<long long>(sqlbuf, sqlscale);
     }
     else
         throw soci_error("Unexpected string type");
 
-    return std::string(var->sqldata + offset, size);
-}
-
-void copy_from_blob(firebird_statement_backend &st, char *buf, std::string &out)
-{
-    firebird_blob_backend blob(st.session_);
-
-    GCC_WARNING_SUPPRESS(cast-align)
-
-    blob.assign(*reinterpret_cast<ISC_QUAD*>(buf));
-
-    GCC_WARNING_RESTORE(cast-align)
-
-    std::size_t const len_total = blob.get_len();
-    out.resize(len_total);
-
-    std::size_t const len_read = blob.read(0, &out[0], len_total);
-    if (len_read != len_total)
-    {
-        std::ostringstream os;
-        os << "Read " << len_read << " bytes instead of expected "
-           << len_total << " from Firebird text blob object";
-        throw soci_error(os.str());
-    }
+    return std::string((char*)sqlbuf + offset, size);
 }
 
 } // namespace firebird

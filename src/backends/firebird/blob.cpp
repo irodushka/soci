@@ -11,9 +11,10 @@
 
 using namespace soci;
 using namespace soci::details::firebird;
+using namespace Firebird;
 
 firebird_blob_backend::firebird_blob_backend(firebird_session_backend &session)
-	  : session_(session), bid_(), from_db_(false), bhp_(0), data_(),
+	  : session_(session), bid_{}, from_db_(false), bhp_(nullptr), data_(),
 		loaded_(false), max_seg_size_(0)
 {}
 
@@ -24,7 +25,7 @@ firebird_blob_backend::~firebird_blob_backend()
 
 std::size_t firebird_blob_backend::get_len()
 {
-    if (from_db_ && bhp_ == 0)
+    if (from_db_ && !bhp_)
     {
         open();
     }
@@ -131,25 +132,25 @@ void firebird_blob_backend::writeBuffer(std::size_t offset,
 
 void firebird_blob_backend::open()
 {
-    if (bhp_ != 0)
+    if ( bhp_ )
     {
         // BLOB already opened
         return;
     }
 
-    ISC_STATUS stat[20];
-
-    if (isc_open_blob2(stat, &session_.dbhp_, session_.current_transaction(),
-                       &bhp_, &bid_, 0, NULL))
+    try
     {
-        bhp_ = 0L;
-        throw_iscerror(stat);
+        bhp_ = session_.dbhp_->openBlob(&session_.status_, session_.current_transaction(), &bid_, 0, NULL);
+        // get basic blob info
+        auto blob_size = getBLOBInfo();
+        data_.resize(blob_size);
     }
-
-    // get basic blob info
-    long blob_size = getBLOBInfo();
-
-    data_.resize(blob_size);
+    catch (const FbException& error)
+    {
+        char buf[1024];
+        session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
+    }
 }
 
 void firebird_blob_backend::cleanUp()
@@ -159,70 +160,56 @@ void firebird_blob_backend::cleanUp()
     max_seg_size_ = 0;
     data_.resize(0);
 
-    if (bhp_ != 0)
+    try
     {
-        // close blob
-        ISC_STATUS stat[20];
-        if (isc_close_blob(stat, &bhp_))
-        {
-            throw_iscerror(stat);
+        if ( bhp_ ) bhp_->close(&session_.status_);
+        bhp_ = nullptr;
+    }
+    catch (const FbException& error)
+    {
+        if( bhp_ ) {
+            bhp_->release();
+            bhp_ = nullptr;
         }
-        bhp_ = 0;
+        char buf[1024];
+        session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
     }
 }
 
 // loads blob data into internal buffer
 void firebird_blob_backend::load()
 {
-    if (bhp_ == 0)
+    if ( !bhp_ )
     {
         open();
     }
 
-    // The blob is empty.
-    if (data_.empty())
+    try
     {
-        return;
+        unsigned bytes;
+        std::vector<char>::size_type total_bytes = 0;
+        bool keep_reading = false;
+        
+        do
+        {
+            bytes = 0;
+            // next segment of data
+            // data_ is large-enough because we know total size of blob
+            
+            auto res = bhp_->getSegment(&session_.status_, static_cast<unsigned>(max_seg_size_), &data_[total_bytes], &bytes);
+            total_bytes += bytes;
+            
+            keep_reading = ( res == IStatus::RESULT_OK || res == IStatus::RESULT_SEGMENT );
+        }
+        while (keep_reading);
     }
-
-    ISC_STATUS stat[20];
-    unsigned short bytes;
-    std::vector<char>::size_type total_bytes = 0;
-    bool keep_reading = false;
-
-    do
+    catch (const FbException& error)
     {
-        bytes = 0;
-        // next segment of data
-        // data_ is large-enough because we know total size of blob
-        isc_get_segment(stat, &bhp_, &bytes, static_cast<short>(max_seg_size_),
-                        &data_[total_bytes]);
-
-        total_bytes += bytes;
-
-        if (total_bytes == data_.size())
-        {
-            // we have all BLOB data
-            keep_reading = false;
-        }
-        else if (stat[1] == 0 || stat[1] == isc_segment)
-        {
-            // there is more data to read from current segment (0)
-            // or there is next segment (isc_segment)
-            keep_reading = true;
-        }
-        else if (stat[1] == isc_segstr_eof)
-        {
-            // BLOB is shorter then we expected ???
-            keep_reading = false;
-        }
-        else
-        {
-            // an error has occured
-            throw_iscerror(stat);
-        }
+        char buf[1024];
+        session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
     }
-    while (keep_reading);
 
     loaded_ = true;
 }
@@ -232,69 +219,65 @@ void firebird_blob_backend::load()
 // BLOB will be closed after save.
 void firebird_blob_backend::save()
 {
-    // close old blob if necessary
-    ISC_STATUS stat[20];
-    if (bhp_ != 0)
+    try
     {
-        if (isc_close_blob(stat, &bhp_))
-        {
-            throw_iscerror(stat);
-        }
-        bhp_ = 0;
-    }
+        if( bhp_ ) bhp_->close(&session_.status_);
+        bhp_ = session_.dbhp_->createBlob(&session_.status_, session_.current_transaction(), &bid_, 0, NULL);
 
-    // create new blob
-    if (isc_create_blob(stat, &session_.dbhp_, session_.current_transaction(),
-                        &bhp_, &bid_))
-    {
-        throw_iscerror(stat);
-    }
-
-    if (data_.size() > 0)
-    {
-        // write data
-        size_t size = data_.size();
-        size_t offset = 0;
-        // Segment Size : Specifying the BLOB segment is throwback to times past, when applications for working
-        // with BLOB data were written in C(Embedded SQL) with the help of the gpre pre - compiler.
-        // Nowadays, it is effectively irrelevant.The segment size for BLOB data is determined by the client side and is usually larger than the data page size,
-        // in any case.
-        do
+        if (data_.size() > 0)
         {
-            unsigned short segmentSize = 0xFFFF; //last unsigned short number
-            if (size - offset < segmentSize) //if content size is less than max segment size or last data segment is about to be written
-                segmentSize = static_cast<unsigned short>(size - offset);
-            //write segment
-            if (isc_put_segment(stat, &bhp_, segmentSize, &data_[0]+offset))
+            // write data
+            size_t size = data_.size();
+            size_t offset = 0;
+            // Segment Size : Specifying the BLOB segment is throwback to times past, when applications for working 
+            // with BLOB data were written in C(Embedded SQL) with the help of the gpre pre - compiler.
+            // Nowadays, it is effectively irrelevant.The segment size for BLOB data is determined by the client side and is usually larger than the data page size, 
+            // in any case.
+            do
             {
-                throw_iscerror(stat);
-            }
-            offset += segmentSize;
+                unsigned short segmentSize = 0xFFFF; //last unsigned short number
+                if (size - offset < segmentSize) //if content size is less than max segment size or last data segment is about to be written
+                    segmentSize = static_cast<unsigned short>(size - offset); 
+                //write segment
+                bhp_->putSegment(&session_.status_, segmentSize, &data_[0]+offset);
+                offset += segmentSize;
+            } 
+            while (offset < size);
         }
-        while (offset < size);
+
+        cleanUp();
+        from_db_ = true;
     }
-    cleanUp();
-    from_db_ = true;
+    catch (const FbException& error)
+    {
+        char buf[1024];
+        session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
+    }
 }
 
 // retrives number of segments and total length of BLOB
 // returns total length of BLOB
 long firebird_blob_backend::getBLOBInfo()
 {
-    char blob_items[] = {isc_info_blob_max_segment, isc_info_blob_total_length};
-    char res_buffer[20], *p, item;
+    const unsigned char blob_items[] = {isc_info_blob_max_segment, isc_info_blob_total_length};
+    unsigned char res_buffer[20];
+    char *p, item;
     short length;
     long total_length = 0;
 
-    ISC_STATUS stat[20];
-
-    if (isc_blob_info(stat, &bhp_, sizeof(blob_items), blob_items,
-                      sizeof(res_buffer), res_buffer))
+    try
     {
-        throw_iscerror(stat);
+        bhp_->getInfo(&session_.status_, sizeof(blob_items), blob_items, sizeof(res_buffer), res_buffer);
+    }
+    catch (const FbException& error)
+    {
+        char buf[1024];
+        session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
     }
 
-    for (p = res_buffer; *p != isc_info_end ;)
+    for (p = reinterpret_cast<char*>(res_buffer); *p != isc_info_end ;)
     {
         item = *p++;
         length = static_cast<short>(isc_vax_integer(p, 2));

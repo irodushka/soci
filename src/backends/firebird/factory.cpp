@@ -14,7 +14,7 @@ using namespace soci;
 firebird_session_backend * firebird_backend_factory::make_session(
     connection_parameters const & parameters) const
 {
-    return new firebird_session_backend(parameters);
+    return new firebird_session_backend(parameters, master_);
 }
 
 firebird_backend_factory const soci::firebird;
