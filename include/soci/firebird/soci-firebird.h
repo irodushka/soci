@@ -46,6 +46,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <set>
 
 #define SOCI_INLINE inline
 #define SOCI_STATIC_INLINE static inline
@@ -253,6 +254,7 @@ struct firebird_session_backend;
 struct firebird_statement_backend : details::statement_backend
 {
     firebird_statement_backend(firebird_session_backend &session);
+    ~firebird_statement_backend();
 
     SOCI_INLINE void alloc() SOCI_OVERRIDE {}
     void clean_up() SOCI_OVERRIDE;
@@ -280,11 +282,17 @@ struct firebird_statement_backend : details::statement_backend
     firebird_session_backend &session_;
 
     Firebird::IStatement* stmtp_;
+
     Firebird::IMessageMetadata* in_meta_;
     Firebird::IMessageMetadata* out_meta_;
     unsigned char* in_buffer_;
     unsigned char* out_buffer_;
+
+protected:
     Firebird::IResultSet* cursor_;
+
+public:
+    void close_cursor();
 
     bool boundByName_;
     bool boundByPos_;
@@ -411,6 +419,34 @@ struct firebird_session_backend : details::session_backend
     Firebird::IProvider* prov_;
     Firebird::IMaster* master_;
     Firebird::ThrowStatusWrapper status_;
+
+    /*
+        This class is used to track the living cycle of cursors& blobs, created on statement-backend
+        The new FB OOAPI has a feature that when the transaction is closed, the cursors&blobs, opened 
+        in that closed transaction, become invalid (closed internally). In that case we can get an exception
+        in a statement's dtor, on the cursor/blob close() call.
+        Therefore, we need to close all the cursors/blobs, associated with our connection, before closing the transaction.
+    */
+    struct Statements {
+        Statements() : st_set_{} {}
+        SOCI_INLINE bool add( firebird_statement_backend* st )   { auto res = st_set_.insert( st ); return res.second; }
+        SOCI_INLINE bool erase( firebird_statement_backend* st ) { return st_set_.erase( st ) == 1; }
+        SOCI_INLINE firebird_statement_backend* find( firebird_statement_backend* st ) {
+            auto it = st_set_.find( st );
+            return it == st_set_.end() ? nullptr : *it;
+        }
+        SOCI_INLINE void closeCursorsAndBlobs() {
+            for( auto * st : st_set_ ) {
+                st->close_cursor();
+                //what about blobs - I see no long-living blobs now in SOCI.
+                //TODO: add blob->close() logic if there are problems here.
+            }
+        }
+        SOCI_INLINE size_t size() { return st_set_.size(); }
+    private:
+        std::set<firebird_statement_backend*> st_set_;
+    };
+    Statements statements_;
 
 private:
     Firebird::ITransaction* trhp_;
