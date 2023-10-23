@@ -9,22 +9,46 @@
 #ifndef SOCI_FIREBIRD_H_INCLUDED
 #define SOCI_FIREBIRD_H_INCLUDED
 
-#include <soci/soci-platform.h>
+#ifdef _WIN32
+# ifdef SOCI_DLL
+#  ifdef SOCI_FIREBIRD_SOURCE
+#   define SOCI_FIREBIRD_DECL __declspec(dllexport)
+#  else
+#   define SOCI_FIREBIRD_DECL __declspec(dllimport)
+#  endif // SOCI_DLL
+# endif // SOCI_FIREBIRD_SOURCE
+#endif // _WIN32
 
-#ifdef SOCI_FIREBIRD_SOURCE
-# define SOCI_FIREBIRD_DECL SOCI_DECL_EXPORT
-#else
-# define SOCI_FIREBIRD_DECL SOCI_DECL_IMPORT
+//
+// If SOCI_FIREBIRD_DECL isn't defined yet define it now
+#ifndef SOCI_FIREBIRD_DECL
+# define SOCI_FIREBIRD_DECL
 #endif
 
 #ifdef _WIN32
 #include <ciso646> // To understand and/or/not on MSVC9
 #endif
 #include <soci/soci-backend.h>
-#include <ibase.h> // FireBird
+
+#ifndef _WIN32
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
+#include <firebird/Interface.h> // unused parameters here)
+
+#ifndef _WIN32
+#pragma GCC diagnostic pop
+#endif
+
+#include <firebird/Message.h>
 #include <cstdlib>
 #include <vector>
 #include <string>
+#include <algorithm>
+
+#define SOCI_INLINE inline
+#define SOCI_STATIC_INLINE static inline
 
 namespace soci
 {
@@ -53,88 +77,143 @@ enum BuffersType
 
 struct firebird_blob_backend;
 struct firebird_statement_backend;
-struct firebird_standard_into_type_backend : details::standard_into_type_backend
-{
-    firebird_standard_into_type_backend(firebird_statement_backend &st)
-        : statement_(st), data_(NULL), type_(), position_(0), buf_(NULL), indISCHolder_(0)
-    {}
 
-    void define_by_pos(int &position,
-        void *data, details::exchange_type type) SOCI_OVERRIDE;
+///// Helpers ////////////////////////////////////////////////////
+// Those helper classes incapsulate the common logic 
+// for into & use backends
 
-    void pre_fetch() SOCI_OVERRIDE;
-    void post_fetch(bool gotData, bool calledFromFetch,
-        indicator *ind) SOCI_OVERRIDE;
+// Common helper
+template <typename T>
+struct firebird_params_helper : public T {
 
-    void clean_up() SOCI_OVERRIDE;
+    static constexpr bool isVector   = std::is_same_v<details::vector_into_type_backend,T> ||
+                                       std::is_same_v<details::vector_use_type_backend,T>;
 
+    static constexpr bool isStandard = std::is_same_v<details::standard_into_type_backend,T> ||
+                                       std::is_same_v<details::standard_use_type_backend,T>;
+
+    static constexpr bool isUse = std::is_same_v<details::vector_use_type_backend,T> ||
+                                  std::is_same_v<details::standard_use_type_backend,T>;
+
+    static constexpr BuffersType backendType = isVector ? eVector : eStandard;
+
+    static_assert( isVector || isStandard );
+
+    SOCI_INLINE firebird_params_helper( firebird_statement_backend &st );
+
+protected:
     firebird_statement_backend &statement_;
-    virtual void exchangeData();
-
     void *data_;
     details::exchange_type type_;
     int position_;
+    unsigned char *buf_;
+    unsigned sqltype_;
+    int sqlscale_;
+    unsigned sqllen_;
+    short* sqlnullptr_;
 
-    char *buf_;
-    short indISCHolder_;
+    Firebird::IMessageMetadata* firebird_meta_;
+    unsigned char* firebird_buffer_;
+    std::vector<void*> & params_;
+
+    void prepare_field( void * data, details::exchange_type type );
+
+    SOCI_INLINE void clean_up() SOCI_OVERRIDE
+    {
+        auto it = std::find( params_.begin(), params_.end(), static_cast<void*>(this) );
+        if (it != params_.end())
+            params_.erase(it);
+    }
 };
 
-struct firebird_vector_into_type_backend : details::vector_into_type_backend
+// Helper for input parameters (uses)
+template <typename T>
+struct firebird_use_type_helper : public firebird_params_helper<T> {
+
+    static_assert( std::is_same_v<details::vector_use_type_backend,T> ||
+                   std::is_same_v<details::standard_use_type_backend,T> );
+
+    SOCI_INLINE firebird_use_type_helper( firebird_statement_backend &st ) :
+        firebird_params_helper<T>( st ) {}
+
+protected:
+    //have to use internals due to different bind_by_pos/bind_by_name signature for standard & vectors (readOnly param)
+    void bind_by_pos_internal(int &position, void *data, details::exchange_type type);
+    void bind_by_name_internal(std::string const &name, void *data, details::exchange_type type);
+};
+
+// Helper for output parameters (intos)
+template <typename T>
+struct firebird_into_type_helper : public firebird_params_helper<T> {
+
+    static_assert( std::is_same_v<details::vector_into_type_backend,T> ||
+                   std::is_same_v<details::standard_into_type_backend,T> );
+
+    SOCI_INLINE firebird_into_type_helper( firebird_statement_backend &st ) :
+        firebird_params_helper<T>( st ) {}
+
+protected:
+    SOCI_INLINE void define_by_pos(int &position, void *data, details::exchange_type type) SOCI_OVERRIDE;
+};
+
+////// Helpers end //////////////////////////////
+
+struct firebird_standard_into_type_backend : public firebird_into_type_helper<details::standard_into_type_backend>
 {
-    firebird_vector_into_type_backend(firebird_statement_backend &st)
-        : statement_(st), data_(NULL), type_(), position_(0), buf_(NULL), indISCHolder_(0)
+    firebird_standard_into_type_backend(firebird_statement_backend &st)
+        : firebird_into_type_helper<details::standard_into_type_backend>( st )
     {}
 
-    void define_by_pos(int &position,
-        void *data, details::exchange_type type) SOCI_OVERRIDE;
+    SOCI_INLINE void pre_fetch() SOCI_OVERRIDE {} // nothing to do
+    void post_fetch(bool gotData, bool calledFromFetch,
+        indicator *ind) SOCI_OVERRIDE;
 
-    void pre_fetch() SOCI_OVERRIDE;
+    virtual void exchangeData();
+
+private:
+    // Copy contents of a BLOB (represented by its id) in buf_ into the given
+    // string.
+    void copy_from_blob(std::string& out);
+};
+
+struct firebird_vector_into_type_backend : public firebird_into_type_helper<details::vector_into_type_backend>
+{
+    firebird_vector_into_type_backend(firebird_statement_backend &st)
+        : firebird_into_type_helper<details::vector_into_type_backend>( st )
+    {}
+
+    SOCI_INLINE void pre_fetch() SOCI_OVERRIDE {} // nothing to do
     void post_fetch(bool gotData, indicator *ind) SOCI_OVERRIDE;
 
     void resize(std::size_t sz) SOCI_OVERRIDE;
     std::size_t size() SOCI_OVERRIDE;
-
-    void clean_up() SOCI_OVERRIDE;
-
-    firebird_statement_backend &statement_;
     virtual void exchangeData(std::size_t row);
-
-    void *data_;
-    details::exchange_type type_;
-    int position_;
-
-    char *buf_;
-    short indISCHolder_;
 };
 
-struct firebird_standard_use_type_backend : details::standard_use_type_backend
+struct firebird_standard_use_type_backend : public firebird_use_type_helper<details::standard_use_type_backend>
 {
     firebird_standard_use_type_backend(firebird_statement_backend &st)
-        : statement_(st), data_(NULL), type_(), position_(0), buf_(NULL), indISCHolder_(0),
-          blob_(NULL)
+        : firebird_use_type_helper<details::standard_use_type_backend>( st )
     {}
 
-    void bind_by_pos(int &position,
-        void *data, details::exchange_type type, bool readOnly) SOCI_OVERRIDE;
-    void bind_by_name(std::string const &name,
-        void *data, details::exchange_type type, bool readOnly) SOCI_OVERRIDE;
+    SOCI_INLINE void bind_by_pos(int &position,
+        void *data, details::exchange_type type, bool /*readOnly*/) SOCI_OVERRIDE
+    { 
+        this->bind_by_pos_internal( position, data, type );
+    }
+
+    SOCI_INLINE void bind_by_name(std::string const &name,
+        void *data, details::exchange_type type, bool /*readOnly*/) SOCI_OVERRIDE
+    {
+        this->bind_by_name_internal( name, data, type );
+    }
 
     void pre_use(indicator const *ind) SOCI_OVERRIDE;
     void post_use(bool gotData, indicator *ind) SOCI_OVERRIDE;
-
-    void clean_up() SOCI_OVERRIDE;
-
-    firebird_statement_backend &statement_;
     virtual void exchangeData();
 
-    void *data_;
-    details::exchange_type type_;
-    int position_;
-
-    char *buf_;
-    short indISCHolder_;
-
 private:
+    //void bind_internal( void * data, details::exchange_type type );
     // Allocate a temporary blob, fill it with the data from the provided
     // string and copy its ID into buf_.
     void copy_to_blob(const std::string& in);
@@ -143,42 +222,31 @@ private:
     firebird_blob_backend* blob_;
 };
 
-struct firebird_vector_use_type_backend : details::vector_use_type_backend
+struct firebird_vector_use_type_backend : public firebird_use_type_helper<details::vector_use_type_backend>
 {
     firebird_vector_use_type_backend(firebird_statement_backend &st)
-        : statement_(st), data_(NULL), type_(), position_(0), buf_(NULL), indISCHolder_(0),
-          blob_(NULL)
+        : firebird_use_type_helper<details::vector_use_type_backend>( st )
     {}
 
-    void bind_by_pos(int &position,
-        void *data, details::exchange_type type) SOCI_OVERRIDE;
-    void bind_by_name(std::string const &name,
-        void *data, details::exchange_type type) SOCI_OVERRIDE;
+    SOCI_INLINE void bind_by_pos(int &position,
+        void *data, details::exchange_type type) SOCI_OVERRIDE
+    {
+        this->bind_by_pos_internal( position, data, type );
+    }
 
-    void pre_use(indicator const *ind) SOCI_OVERRIDE;
+    SOCI_INLINE void bind_by_name(std::string const &name,
+        void *data, details::exchange_type type) SOCI_OVERRIDE
+    {
+        this->bind_by_name_internal( name, data, type );
+    }
+
+    SOCI_INLINE void pre_use(indicator const *ind) SOCI_OVERRIDE;
 
     std::size_t size() SOCI_OVERRIDE;
 
-    void clean_up() SOCI_OVERRIDE;
-
-    firebird_statement_backend &statement_;
     virtual void exchangeData(std::size_t row);
 
-    void *data_;
-    details::exchange_type type_;
-    int position_;
     indicator const *inds_;
-
-    char *buf_;
-    short indISCHolder_;
-
-private:
-    // Allocate a temporary blob, fill it with the data from the provided
-    // string and copy its ID into buf_.
-    void copy_to_blob(const std::string &in);
-
-    // This is used for types mapping to CLOB.
-    firebird_blob_backend *blob_;
 };
 
 struct firebird_session_backend;
@@ -186,7 +254,7 @@ struct firebird_statement_backend : details::statement_backend
 {
     firebird_statement_backend(firebird_session_backend &session);
 
-    void alloc() SOCI_OVERRIDE;
+    SOCI_INLINE void alloc() SOCI_OVERRIDE {}
     void clean_up() SOCI_OVERRIDE;
     void prepare(std::string const &query,
         details::statement_type eType) SOCI_OVERRIDE;
@@ -195,7 +263,7 @@ struct firebird_statement_backend : details::statement_backend
     exec_fetch_result fetch(int number) SOCI_OVERRIDE;
 
     long long get_affected_rows() SOCI_OVERRIDE;
-    int get_number_of_rows() SOCI_OVERRIDE;
+    SOCI_INLINE int get_number_of_rows() SOCI_OVERRIDE { return rowsFetched_; };
     std::string get_parameter_name(int index) const SOCI_OVERRIDE;
 
     std::string rewrite_for_procedure_call(std::string const &query) SOCI_OVERRIDE;
@@ -211,17 +279,27 @@ struct firebird_statement_backend : details::statement_backend
 
     firebird_session_backend &session_;
 
-    isc_stmt_handle stmtp_;
-    XSQLDA * sqldap_;
-    XSQLDA * sqlda2p_;
+    Firebird::IStatement* stmtp_;
+    Firebird::IMessageMetadata* in_meta_;
+    Firebird::IMessageMetadata* out_meta_;
+    unsigned char* in_buffer_;
+    unsigned char* out_buffer_;
+    Firebird::IResultSet* cursor_;
 
     bool boundByName_;
     bool boundByPos_;
 
-    friend struct firebird_vector_into_type_backend;
-    friend struct firebird_standard_into_type_backend;
-    friend struct firebird_vector_use_type_backend;
-    friend struct firebird_standard_use_type_backend;
+    std::vector<std::vector<indicator> > inds_;
+    std::vector<void*> intos_;
+    std::vector<void*> uses_;
+
+    // accessor methods (instead of "friends")
+    SOCI_INLINE void setIntoType( BuffersType type ) { intoType_ = type; }
+    SOCI_INLINE void setUsesType( BuffersType type ) { useType_  = type; }
+    SOCI_INLINE int findParamByName( const std::string& name ) {
+        auto it = names_.find(name);
+        return it == names_.end() ? -1 : it->second;
+    }
 
 protected:
     int rowsFetched_;
@@ -230,7 +308,6 @@ protected:
     long long rowsAffectedBulk_; // number of rows affected by the last bulk operation
 
     virtual void exchangeData(bool gotData, int row);
-    virtual void prepareSQLDA(XSQLDA ** sqldap, short size = 10);
     virtual void rewriteQuery(std::string const & query,
         std::vector<char> & buffer);
     virtual void rewriteParameters(std::string const & src,
@@ -238,10 +315,6 @@ protected:
 
     BuffersType intoType_;
     BuffersType useType_;
-
-    std::vector<std::vector<indicator> > inds_;
-    std::vector<void*> intos_;
-    std::vector<void*> uses_;
 
     // named parameters
     std::map <std::string, int> names_;
@@ -282,7 +355,7 @@ struct firebird_blob_backend : details::blob_backend
     bool from_db_;
 
     // BLOB handle
-    isc_blob_handle bhp_;
+    Firebird::IBlob* bhp_;
 
 protected:
 
@@ -302,13 +375,14 @@ protected:
 
 struct firebird_session_backend : details::session_backend
 {
-    firebird_session_backend(connection_parameters const & parameters);
+    firebird_session_backend(connection_parameters const & parameters, Firebird::IMaster* master);
 
     ~firebird_session_backend() SOCI_OVERRIDE;
 
     bool is_connected() SOCI_OVERRIDE;
 
     void begin() SOCI_OVERRIDE;
+    void start_transaction(transaction_parameters const &) SOCI_OVERRIDE;
     void commit() SOCI_OVERRIDE;
     void rollback() SOCI_OVERRIDE;
 
@@ -331,21 +405,31 @@ struct firebird_session_backend : details::session_backend
     // transaction if necessary.
     //
     // The returned pointer should
-    isc_tr_handle* current_transaction();
+    Firebird::ITransaction* current_transaction();
 
-    isc_db_handle dbhp_;
+    Firebird::IAttachment* dbhp_;
+    Firebird::IProvider* prov_;
+    Firebird::IMaster* master_;
+    Firebird::ThrowStatusWrapper status_;
 
 private:
-    isc_tr_handle trhp_;
+    Firebird::ITransaction* trhp_;
     bool decimals_as_strings_;
 };
 
 struct firebird_backend_factory : backend_factory
 {
-    firebird_backend_factory() {}
+    firebird_backend_factory() : master_{ Firebird::fb_get_master_interface() } {}
+    ~firebird_backend_factory() { fb_shutdown(fb_shutrsn_app_stopped, 0); }
+
     firebird_session_backend * make_session(
         connection_parameters const & parameters) const SOCI_OVERRIDE;
+private:
+    Firebird::IMaster* master_;
 };
+
+// param helpers implementation here, stored in header to avoid templates linkage issues
+#include "firebird/params_helper.h"
 
 extern SOCI_FIREBIRD_DECL firebird_backend_factory const firebird;
 
