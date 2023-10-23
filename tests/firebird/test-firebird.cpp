@@ -1258,13 +1258,7 @@ namespace soci
             statementBackEnd->session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
             throw firebird_soci_error( std::string(buf) );
         }
-/*
-        if (isc_dsql_sql_info(stat, &statementBackEnd->stmtp_, sizeof(cnt_req),
-                              cnt_req, sizeof(cnt_info), cnt_info))
-        {
-            soci::details::firebird::throw_iscerror(stat);
-        }
-*/
+
         long count = -1;
         char type_ = static_cast<char>(type);
         for (char *ptr = (char*)cnt_info + 3; *ptr != isc_info_end;)
