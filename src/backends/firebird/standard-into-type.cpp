@@ -14,33 +14,10 @@
 
 #include <sstream>
 
+using namespace Firebird;
 using namespace soci;
 using namespace soci::details;
 using namespace soci::details::firebird;
-
-void firebird_standard_into_type_backend::define_by_pos(
-    int & position, void * data, exchange_type type)
-{
-    position_ = position-1;
-    data_ = data;
-    type_ = type;
-
-    ++position;
-
-    statement_.intoType_ = eStandard;
-    statement_.intos_.push_back(static_cast<void*>(this));
-
-    XSQLVAR *var = statement_.sqldap_->sqlvar+position_;
-
-    buf_ = allocBuffer(var);
-    var->sqldata = buf_;
-    var->sqlind = &indISCHolder_;
-}
-
-void firebird_standard_into_type_backend::pre_fetch()
-{
-    // nothing to do
-}
 
 void firebird_standard_into_type_backend::post_fetch(
     bool gotData, bool calledFromFetch, indicator * ind)
@@ -68,39 +45,33 @@ void firebird_standard_into_type_backend::post_fetch(
 
 void firebird_standard_into_type_backend::exchangeData()
 {
-    XSQLVAR *var = statement_.sqldap_->sqlvar+position_;
-
     switch (type_)
     {
             // simple cases
         case x_char:
-            exchange_type_cast<x_char>(data_) = getTextParam(var)[0];
+            exchange_type_cast<x_char>(data_) = getTextParam(buf_, sqltype_, sqllen_, sqlscale_)[0];
             break;
         case x_short:
-            exchange_type_cast<x_short>(data_) = from_isc<short>(var);
+            exchange_type_cast<x_short>(data_) = from_isc<short>(buf_, sqltype_, sqlscale_);
             break;
         case x_integer:
-            exchange_type_cast<x_integer>(data_) = from_isc<int>(var);
+            exchange_type_cast<x_integer>(data_) = from_isc<int>(buf_, sqltype_, sqlscale_);
             break;
         case x_long_long:
-            exchange_type_cast<x_long_long>(data_) = from_isc<long long>(var);
-            break;
-        case x_unsigned_long_long:
-            exchange_type_cast<x_unsigned_long_long>(data_) =
-                from_isc<unsigned long long>(var);
+            exchange_type_cast<x_long_long>(data_) = from_isc<long long>(buf_, sqltype_, sqlscale_);
             break;
         case x_double:
-            exchange_type_cast<x_double>(data_) = from_isc<double>(var);
+            exchange_type_cast<x_double>(data_) = from_isc<double>(buf_, sqltype_, sqlscale_);
             break;
 
             // cases that require adjustments and buffer management
         case x_stdstring:
-            exchange_type_cast<x_stdstring>(data_) = getTextParam(var);
+            exchange_type_cast<x_stdstring>(data_) = getTextParam(buf_, sqltype_, sqllen_, sqlscale_);
             break;
         case x_stdtm:
             {
                 std::tm& t = exchange_type_cast<x_stdtm>(data_);
-                tmDecode(var->sqltype, buf_, &t);
+                tmDecode(sqltype_, buf_, &t);
 
                 // isc_decode_timestamp() used by tmDecode() incorrectly sets
                 // tm_isdst to 0 in the struct that it creates, see
@@ -132,17 +103,11 @@ void firebird_standard_into_type_backend::exchangeData()
             break;
 
         case x_longstring:
-            {
-                std::string &tmp = exchange_type_cast<x_longstring>(data_).value;
-                copy_from_blob(statement_, buf_, tmp);
-            }
+            copy_from_blob(exchange_type_cast<x_longstring>(data_).value);
             break;
 
         case x_xmltype:
-            {
-                std::string &tmp = exchange_type_cast<x_xmltype>(data_).value;
-                copy_from_blob(statement_, buf_, tmp);
-            }
+            copy_from_blob(exchange_type_cast<x_xmltype>(data_).value);
             break;
 
         default:
@@ -150,15 +115,25 @@ void firebird_standard_into_type_backend::exchangeData()
     } // switch
 }
 
-void firebird_standard_into_type_backend::clean_up()
+void firebird_standard_into_type_backend::copy_from_blob(std::string& out)
 {
-    if (buf_ != NULL)
+    firebird_blob_backend blob(statement_.session_);
+
+    GCC_WARNING_SUPPRESS(cast-align)
+
+    blob.assign(*reinterpret_cast<ISC_QUAD*>(buf_));
+
+    GCC_WARNING_RESTORE(cast-align)
+
+    std::size_t const len_total = blob.get_len();
+    out.resize(len_total);
+
+    std::size_t const len_read = blob.read(0, &out[0], len_total);
+    if (len_read != len_total)
     {
-        delete [] buf_;
-        buf_ = NULL;
+        std::ostringstream os;
+        os << "Read " << len_read << " bytes instead of expected "
+           << len_total << " from Firebird text blob object";
+        throw soci_error(os.str());
     }
-    std::vector<void*>::iterator it =
-        std::find(statement_.intos_.begin(), statement_.intos_.end(), this);
-    if (it != statement_.intos_.end())
-        statement_.intos_.erase(it);
 }

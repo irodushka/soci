@@ -16,6 +16,7 @@
 
 using namespace soci;
 using namespace soci::details::firebird;
+using namespace Firebird;
 
 namespace
 {
@@ -196,66 +197,74 @@ bool getISCConnectParameter(std::map<std::string, std::string> const & m, std::s
     }
 }
 
-void setDPBOption(std::string& dpb, int const option, std::string const & value)
-{
-
-    if (dpb.empty())
-    {
-        dpb.append(1, static_cast<char>(isc_dpb_version1));
-    }
-
-    // now we are adding new option
-    dpb.append(1, static_cast<char>(option));
-    dpb.append(1, static_cast<char>(value.size()));
-    dpb.append(value);
-}
-
 } // namespace anonymous
 
 firebird_session_backend::firebird_session_backend(
-    connection_parameters const & parameters) : dbhp_(0), trhp_(0)
+    connection_parameters const & parameters, Firebird::IMaster* master) : dbhp_(nullptr)
+                                         , prov_{master->getDispatcher()}
+                                         , master_{master}
+                                         , status_{master_->getStatus()}
+                                         , trhp_(nullptr)
                                          , decimals_as_strings_(false)
 {
     // extract connection parameters
     std::map<std::string, std::string>
         params(explodeISCConnectString(parameters.get_connect_string()));
 
-    ISC_STATUS stat[stat_size];
     std::string param;
+    IUtil* utl    = master_->getUtilInterface();
+    IXpbBuilder* dpb = nullptr;
 
-    // preparing connection options
-    std::string dpb;
-    if (getISCConnectParameter(params, "user", param))
+    try
     {
-        setDPBOption(dpb, isc_dpb_user_name, param);
+        dpb = utl->getXpbBuilder(&status_, IXpbBuilder::DPB, NULL, 0);
+
+        // preparing connection options
+        int connect_timeout = 0;
+
+        if (getISCConnectParameter(params, "user", param))
+        {
+            dpb->insertString(&status_, isc_dpb_user_name, param.c_str());
+        }
+
+        if (getISCConnectParameter(params, "password", param))
+        {
+            dpb->insertString(&status_, isc_dpb_password, param.c_str());
+        }
+
+        if (getISCConnectParameter(params, "role", param))
+        {
+            dpb->insertString(&status_, isc_dpb_sql_role_name, param.c_str());
+        }
+
+        if (getISCConnectParameter(params, "charset", param))
+        {
+            dpb->insertString(&status_, isc_dpb_lc_ctype, param.c_str());
+        }
+
+        if (parameters.get_option("connect_timeout", param) ||
+                getISCConnectParameter(params, "connect_timeout", param))
+        {
+            connect_timeout = std::stol(param); // throws
+        }
+        if (connect_timeout > 0) {
+            dpb->insertInt(&status_, isc_dpb_connect_timeout, connect_timeout);
+        }
+        if (getISCConnectParameter(params, "service", param) == false)
+        {
+            throw soci_error("Service name not specified.");
+        }
+
+        // connecting data base
+        dbhp_ = prov_->attachDatabase( &status_, param.c_str(), dpb->getBufferLength(&status_), dpb->getBuffer(&status_) );
+        dpb->dispose();
     }
-
-    if (getISCConnectParameter(params, "password", param))
+    catch (const FbException& error)
     {
-        setDPBOption(dpb, isc_dpb_password, param);
-    }
-
-    if (getISCConnectParameter(params, "role", param))
-    {
-        setDPBOption(dpb, isc_dpb_sql_role_name, param);
-    }
-
-    if (getISCConnectParameter(params, "charset", param))
-    {
-        setDPBOption(dpb, isc_dpb_lc_ctype, param);
-    }
-
-    if (getISCConnectParameter(params, "service", param) == false)
-    {
-        throw soci_error("Service name not specified.");
-    }
-
-    // connecting data base
-    if (isc_attach_database(stat, static_cast<short>(param.size()),
-        const_cast<char*>(param.c_str()), &dbhp_,
-        static_cast<short>(dpb.size()), const_cast<char*>(dpb.c_str())))
-    {
-        throw_iscerror(stat);
+        if( dpb ) dpb->dispose();
+        char buf[1024];
+        utl->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
     }
 
     if (getISCConnectParameter(params, "decimals_as_strings", param))
@@ -267,89 +276,229 @@ firebird_session_backend::firebird_session_backend(
 
 void firebird_session_backend::begin()
 {
-    if (trhp_ == 0)
+    if ( !trhp_ )
     {
-        ISC_STATUS stat[stat_size];
-        if (isc_start_transaction(stat, &trhp_, 1, &dbhp_, 0, NULL))
+        try
         {
-            throw_iscerror(stat);
+            trhp_ = dbhp_->startTransaction(&status_, 0, NULL);
+        }
+        catch (const FbException& error)
+        {
+            char buf[1024];
+            master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+            throw firebird_soci_error( std::string(buf) );
+        }
+    }
+}
+
+void firebird_session_backend::start_transaction(const transaction_parameters &tp)
+{
+    if ( !trhp_ )
+    {
+        IUtil* utl    = master_->getUtilInterface();
+        IXpbBuilder* tpb = nullptr;
+        
+        try
+        {
+            tpb = utl->getXpbBuilder(&status_, IXpbBuilder::TPB, NULL, 0);
+
+            switch(tp.access_mode) {
+            case tp_access_mode::READ_WRITE:
+                tpb->insertTag(&status_, isc_tpb_write);
+                break;
+            case tp_access_mode::READ_ONLY:
+                tpb->insertTag(&status_, isc_tpb_read);
+                break;
+            }
+
+            switch(tp.isolation_level) {
+            case tp_isolation_level::SNAPSHOT:
+                tpb->insertTag(&status_, isc_tpb_concurrency);
+                break;
+            case tp_isolation_level::SNAPSHOT_TABLE_STABILITY:
+                tpb->insertTag(&status_, isc_tpb_consistency);
+                break;
+            case tp_isolation_level::READ_COMMITTED_RECORD_VERSION:
+                tpb->insertTag(&status_, isc_tpb_read_committed);
+                tpb->insertTag(&status_, isc_tpb_rec_version);
+                break;
+            case tp_isolation_level::READ_COMMITTED_NO_RECORD_VERSION:
+                tpb->insertTag(&status_, isc_tpb_read_committed);
+                tpb->insertTag(&status_, isc_tpb_no_rec_version);
+                break;
+            }
+
+            switch(tp.lock_resolution) {
+            case tp_lock_resolution::WAIT:
+                tpb->insertTag(&status_, isc_tpb_wait);
+                break;
+            case tp_lock_resolution::NO_WAIT:
+                tpb->insertTag(&status_, isc_tpb_nowait);
+                break;
+            }
+            if (tp.lock_timeout>0) {
+                tpb->insertInt(&status_, isc_tpb_lock_timeout, tp.lock_timeout);
+            }
+
+            for (const auto &reservation: tp.table_reservation) {
+                switch(reservation.second) {
+                case tp_reservation::PROTECTED_READ:
+                    tpb->insertBytes(&status_, isc_tpb_lock_read, reservation.first.c_str(), reservation.first.length());
+                    tpb->insertTag(&status_, isc_tpb_protected);
+                    break;
+                case tp_reservation::PROTECTED_WRITE:
+                    tpb->insertBytes(&status_, isc_tpb_lock_write, reservation.first.c_str(), reservation.first.length());
+                    tpb->insertTag(&status_, isc_tpb_protected);
+                    break;
+                case tp_reservation::SHARED_READ:
+                    tpb->insertBytes(&status_, isc_tpb_lock_read, reservation.first.c_str(), reservation.first.length());
+                    tpb->insertTag(&status_, isc_tpb_shared);
+                    break;
+                case tp_reservation::SHARED_WRITE:
+                    tpb->insertBytes(&status_, isc_tpb_lock_write, reservation.first.c_str(), reservation.first.length());
+                    tpb->insertTag(&status_, isc_tpb_shared);
+                    break;
+                }
+            }
+            
+            trhp_ = dbhp_->startTransaction(&status_, tpb->getBufferLength(&status_), tpb->getBuffer(&status_));
+            tpb->dispose();
+        }
+        catch (const FbException& error)
+        {
+            if( tpb ) tpb->dispose();
+            char buf[1024];
+            utl->formatStatus(buf, sizeof(buf), error.getStatus());
+            throw firebird_soci_error( std::string(buf) );
         }
     }
 }
 
 firebird_session_backend::~firebird_session_backend()
 {
-    cleanUp();
+    try {
+        cleanUp();
+    } catch (const firebird_soci_error &ex) {
+        // @TODO report error some how
+    }
 }
 
 bool firebird_session_backend::is_connected()
 {
-    ISC_STATUS stat[stat_size];
-    ISC_SCHAR req[] = { isc_info_ods_version, isc_info_end };
-    ISC_SCHAR res[256];
-
-    return isc_database_info(stat, &dbhp_, sizeof(req), req, sizeof(res), res) == 0;
+    const unsigned char req[] = { isc_info_ods_version, isc_info_end };
+    unsigned char res[256];
+    
+    try
+    {
+        dbhp_->getInfo( &status_, sizeof(req), req, sizeof(res), res );
+    }
+    catch (const FbException& error)
+    {
+        char buf[1024];
+        master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
+    }
+    
+    return status_.getState() == 0;
 }
 
 void firebird_session_backend::commit()
 {
-    ISC_STATUS stat[stat_size];
-
-    if (trhp_ != 0)
-    {
-        if (isc_commit_transaction(stat, &trhp_))
-        {
-            throw_iscerror(stat);
+    struct Finalizer {
+        firebird_session_backend* parent_;
+        Finalizer( firebird_session_backend* parent ) : parent_{parent} {}
+        ~Finalizer() {
+            if( parent_->trhp_ ) {
+                parent_->trhp_->release();
+                parent_->trhp_ = nullptr;
+            }
         }
+    };
 
-        trhp_ = 0;
+    if ( trhp_ )
+    {
+        Finalizer finalizer( this );
+        try
+        {
+            trhp_->commit(&status_);
+            trhp_ = nullptr;
+        }
+        catch (const FbException& error)
+        {
+            char buf[1024];
+            master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+            throw firebird_soci_error( std::string(buf) );
+        }
     }
 }
 
 void firebird_session_backend::rollback()
 {
-    ISC_STATUS stat[stat_size];
-
-    if (trhp_ != 0)
-    {
-        if (isc_rollback_transaction(stat, &trhp_))
-        {
-            throw_iscerror(stat);
+    struct Finalizer {
+        firebird_session_backend* parent_;
+        Finalizer( firebird_session_backend* parent ) : parent_{parent} {}
+        ~Finalizer() {
+            if( parent_->trhp_ ) {
+                parent_->trhp_->release();
+                parent_->trhp_ = nullptr;
+            }
         }
+    };
 
-        trhp_ = 0;
+    if ( trhp_ )
+    {
+        Finalizer finalizer( this );
+        try
+        {
+            trhp_->rollback(&status_);
+            trhp_ = nullptr;
+        }
+        catch (const FbException& error)
+        {
+            char buf[1024];
+            master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+            throw firebird_soci_error( std::string(buf) );
+        }
     }
 }
 
-isc_tr_handle* firebird_session_backend::current_transaction()
+Firebird::ITransaction* firebird_session_backend::current_transaction()
 {
     // It will do nothing if we're already inside a transaction.
     begin();
-
-    return &trhp_;
+    return trhp_;
 }
 
 void firebird_session_backend::cleanUp()
 {
-    ISC_STATUS stat[stat_size];
-
-    // at the end of session our transaction is finally commited.
-    if (trhp_ != 0)
-    {
-        if (isc_commit_transaction(stat, &trhp_))
-        {
-            throw_iscerror(stat);
+    struct Finalizer {
+        firebird_session_backend* parent_;
+        Finalizer( firebird_session_backend* parent ) : parent_{parent} {}
+        ~Finalizer() {
+            if( parent_->dbhp_ ) {
+                parent_->dbhp_->release();
+                parent_->dbhp_ = nullptr;
+            }
+            parent_->prov_->release();
+            parent_->status_.dispose();
         }
+    };
 
-        trhp_ = 0;
-    }
+    Finalizer finalizer( this );
 
-    if (isc_detach_database(stat, &dbhp_))
+    this->commit();
+
+    try
     {
-        throw_iscerror(stat);
+        dbhp_->detach(&status_);
+        dbhp_ = nullptr;
     }
-
-    dbhp_ = 0L;
+    catch (const FbException& error)
+    {
+        char buf[1024];
+        master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
+    }
 }
 
 bool firebird_session_backend::get_next_sequence_value(
