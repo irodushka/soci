@@ -17,11 +17,283 @@
 #include <ctime>
 #include <cstring>
 #include <cmath>
+#include <thread>
+#include <future>
 
 using namespace soci;
 
 std::string connectString;
 soci::backend_factory const &backEnd = *factory_firebird();
+
+
+TEST_CASE("Firebird transaction_parameters", "[firebird][transaction_parameters]")
+{
+    soci::session sql(backEnd, connectString);
+    soci::session sql2(backEnd, connectString); // second connection used to monitor original connection
+
+    auto mypid = getpid();
+
+    int sql_id = 0;
+    sql2 << "select first(1) mon$attachment_id from mon$attachments where mon$remote_pid=? or (mon$remote_host is null and mon$server_pid=?) order by 1"
+            , use(mypid), use(mypid), into(sql_id);
+    REQUIRE(sql_id != 0);
+
+    int transactions = 0;
+    sql2 << "select count(*) from mon$transactions where mon$attachment_id = ?", use(sql_id), into(transactions);
+    CHECK(transactions == 0);
+
+    sql.begin();
+    sql2.commit();
+    sql2 << "select count(*) from mon$transactions where mon$attachment_id = ?", use(sql_id), into(transactions);
+    CHECK(transactions == 1);
+
+    sql.commit();
+    sql2.commit();
+    sql2 << "select count(*) from mon$transactions where mon$attachment_id = ?", use(sql_id), into(transactions);
+    CHECK(transactions == 0);
+
+    {
+        transaction_parameters tp;
+        INFO("tp="<<tp);
+        sql.begin(tp);
+        sql2.commit();
+        int tr_id = 0, isolation = 0, read_only = -1, lock_timeout = -2;
+        sql2 << "select mon$transaction_id, mon$isolation_mode, mon$read_only, mon$lock_timeout from mon$transactions where mon$attachment_id = ?"
+                , use(sql_id), into(tr_id), into(isolation), into(read_only), into(lock_timeout);
+        CHECK(tr_id != 0);
+        CHECK(isolation == 1);
+        CHECK(read_only == 0);
+        CHECK(lock_timeout == -1);
+        sql.commit();
+    }
+
+    {
+        transaction_parameters tp;
+        tp.isolation_level = tp_isolation_level::READ_COMMITTED_RECORD_VERSION;
+        tp.access_mode = tp_access_mode::READ_ONLY;
+        tp.lock_timeout = 10;
+        INFO("tp="<<tp);
+        sql.begin(tp);
+        sql2.commit();
+        int tr_id = 0, isolation = 0, read_only = -1, lock_timeout = -2;
+        sql2 << "select mon$transaction_id, mon$isolation_mode, mon$read_only, mon$lock_timeout from mon$transactions where mon$attachment_id = ?"
+                , use(sql_id), into(tr_id), into(isolation), into(read_only), into(lock_timeout);
+        CHECK(tr_id != 0);
+        CHECK(isolation == 2);
+        CHECK(read_only == 1);
+        CHECK(lock_timeout == 10);
+        sql.commit();
+    }
+
+
+    {
+        transaction_parameters tp;
+        tp.isolation_level = tp_isolation_level::READ_COMMITTED_NO_RECORD_VERSION;
+        tp.access_mode = tp_access_mode::READ_ONLY;
+        tp.lock_timeout = 10;
+        INFO("tp="<<tp);
+        transaction tr(sql, tp);
+        sql2.commit();
+        int tr_id = 0, isolation = 0, read_only = -1, lock_timeout = -2;
+        sql2 << "select mon$transaction_id, mon$isolation_mode, mon$read_only, mon$lock_timeout from mon$transactions where mon$attachment_id = ?"
+                , use(sql_id), into(tr_id), into(isolation), into(read_only), into(lock_timeout);
+        CHECK(tr_id != 0);
+        CHECK(isolation == 3);
+        CHECK(read_only == 1);
+        CHECK(lock_timeout == 10);
+    }
+    transactions = -1;
+    sql2.commit();
+    sql2 << "select count(*) from mon$transactions where mon$attachment_id = ?", use(sql_id), into(transactions);
+    CHECK(transactions == 0);
+}
+
+// fundamental tests - transactions in Firebird
+TEST_CASE("Firebird connect timeout", "[firebird][connect_timeout][hide]")
+{
+
+    INFO("connectString="<<connectString);
+    connection_parameters params(backEnd, connectString);
+    params.set_option("connect_timeout", "5");
+    auto func = [&params](){
+        soci::session sql(params);  // throw exception if host is not reachable in specified number of seconds
+    };
+    CHECK_THROWS(func());
+}
+
+// fundamental tests - transactions in Firebird
+TEST_CASE("Firebird deadlock", "[firebird][deadlock][no_wait]")
+{
+    soci::session sql(backEnd, connectString);
+    try
+    {
+        sql << "drop table test1";
+    }
+    catch (soci_error const &)
+    {} // ignore if error
+    sql.commit();
+    sql << "create table test1 (id integer, val char(1))";
+    sql.commit();
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (1, 'A')");
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (2, 'B')");
+    sql.commit();
+
+    soci::session sql1(backEnd, connectString);
+    soci::session sql2(backEnd, connectString);
+    transaction_parameters tp1;
+    transaction_parameters tp2;
+    tp2.isolation_level = tp_isolation_level::READ_COMMITTED_RECORD_VERSION;
+    tp2.lock_resolution = tp_lock_resolution::NO_WAIT;
+    transaction tr1(sql1);
+    transaction tr2(sql2, tp2);
+    CHECK_NOTHROW(sql1 << "update test1 set val='X' where id=1");
+    CHECK_NOTHROW(sql2 << "update test1 set val='Y' where id=2");
+    CHECK_THROWS(sql2 << "update test1 set val='Z' where id=1");
+
+    tr2.commit();
+    tr1.commit();
+
+    std::vector<std::string> vals;
+    vals.resize(2);
+    sql << "select val from test1 order by id", into(vals);
+    REQUIRE(vals.size()==2);
+    CHECK(vals[0]=="X");
+    CHECK(vals[1]=="Y");
+}
+
+// fundamental tests - transactions in Firebird
+TEST_CASE("Firebird deadlock with timeout", "[firebird][deadlock][timeout]")
+{
+    soci::session sql(backEnd, connectString);
+    try
+    {
+        sql << "drop table test1";
+    }
+    catch (soci_error const &)
+    {} // ignore if error
+    sql.commit();
+    sql << "create table test1 (id integer, val char(1))";
+    sql.commit();
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (1, 'A')");
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (2, 'B')");
+    sql.commit();
+
+    soci::session sql1(backEnd, connectString);
+    soci::session sql2(backEnd, connectString);
+    transaction_parameters tp1;
+    transaction_parameters tp2;
+    tp2.isolation_level = tp_isolation_level::READ_COMMITTED_RECORD_VERSION;
+    tp2.lock_resolution = tp_lock_resolution::WAIT;
+    tp2.lock_timeout = 3;
+    transaction tr1(sql1);
+    transaction tr2(sql2, tp2);
+    CHECK_NOTHROW(sql1 << "update test1 set val='X' where id=1");
+    CHECK_NOTHROW(sql2 << "update test1 set val='Y' where id=2");
+    auto op1 = std::async([&sql1]() {
+        sql1 << "update test1 set val='X' where id=2";
+    });
+    auto op2 = std::async([&sql2]() {
+        sql2 << "update test1 set val='Y' where id=1";
+    });
+    CHECK(op1.wait_for(std::chrono::seconds(1)) == std::future_status::timeout);
+    CHECK(op2.wait_for(std::chrono::seconds(1)) == std::future_status::timeout);
+    CHECK(op2.wait_for(std::chrono::seconds(2)) == std::future_status::ready); // lock_timeout passed
+
+    CHECK_THROWS(op2.get());
+    CHECK(op1.wait_for(std::chrono::seconds(1)) == std::future_status::timeout); // op1 still waits for other transaction to finish
+    tr2.rollback();
+    CHECK(op1.wait_for(std::chrono::seconds(1)) == std::future_status::ready); // op1 have finished as blocking transaction complete
+    CHECK_NOTHROW(op1.get());
+    tr1.commit();
+
+    std::vector<std::string> vals;
+    vals.resize(2);
+    sql << "select val from test1 order by id", into(vals);
+    REQUIRE(vals.size()==2);
+    CHECK(vals[0]=="X");
+    CHECK(vals[1]=="X");
+}
+
+TEST_CASE("Firebird transactions reserving", "[firebird][transactions][reserving]")
+{
+    soci::session sql(backEnd, connectString);
+    try
+    {
+        sql << "drop table test1";
+    }
+    catch (soci_error const &)
+    {} // ignore if error
+    sql.commit();
+    sql << "create table test1 (id integer, val char(1))";
+    sql.commit();
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (1, 'A')");
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (2, 'B')");
+    sql.commit();
+
+    transaction_parameters tp;
+    tp.table_reservation["TEST1"] = tp_reservation::PROTECTED_WRITE;
+    sql.begin(tp);
+}
+
+
+TEST_CASE("Firebird deadlock reserving", "[firebird][deadlock][reserving]")
+{
+    soci::session sql(backEnd, connectString);
+    try
+    {
+        sql << "drop table test1";
+    }
+    catch (soci_error const &)
+    {} // ignore if error
+    sql.commit();
+    sql << "create table test1 (id integer, val char(1))";
+    sql.commit();
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (1, 'A')");
+    CHECK_NOTHROW(sql << "insert into test1(id, val) values (2, 'B')");
+    sql.commit();
+
+    soci::session sql1(backEnd, connectString);
+    soci::session sql2(backEnd, connectString);
+
+    transaction_parameters tp1;
+    tp1.table_reservation["TEST1"] = tp_reservation::PROTECTED_WRITE;
+
+    transaction_parameters tp2;
+    tp2.isolation_level = tp_isolation_level::READ_COMMITTED_RECORD_VERSION;
+    tp2.lock_resolution = tp_lock_resolution::WAIT;
+    tp2.lock_timeout = 3;
+    tp2.table_reservation["TEST1"] = tp_reservation::PROTECTED_WRITE;
+
+    CAPTURE(tp1);
+    CAPTURE(tp2);
+    transaction tr1(sql1, tp1);
+
+    auto op2 = std::async([&sql2, &tp2]() {
+        sql2.begin(tp2);
+        return std::async([&sql2]() {
+            sql2 << "update test1 set val='Y' where id=2";
+            sql2 << "update test1 set val='Y' where id=1";
+        });
+    });
+    CHECK(op2.wait_for(std::chrono::seconds(1)) == std::future_status::timeout); // waits in begin
+
+    CHECK_NOTHROW(sql1 << "update test1 set val='X' where id=1");
+    CHECK_NOTHROW(sql1 << "update test1 set val='X' where id=2");
+    CHECK(op2.wait_for(std::chrono::seconds(1)) == std::future_status::timeout);
+    tr1.commit();
+    CHECK(op2.wait_for(std::chrono::seconds(1)) == std::future_status::ready); // concurent transaction finished
+    auto op3 = op2.get();  // op1 started next operation
+    CHECK(op3.wait_for(std::chrono::seconds(1)) == std::future_status::ready); // op1 still waits for other transaction to finish
+    CHECK_NOTHROW(op3.get());
+    sql2.commit();
+
+    std::vector<std::string> vals;
+    vals.resize(2);
+    sql << "select val from test1 order by id", into(vals);
+    REQUIRE(vals.size()==2);
+    CHECK(vals[0]=="Y");
+    CHECK(vals[1]=="Y");
+}
 
 // fundamental tests - transactions in Firebird
 TEST_CASE("Firebird transactions", "[firebird][transaction]")
@@ -963,8 +1235,7 @@ namespace soci
     // or -1 if there is no such counter available.
     long getRowCount(soci::statement & statement, eRowCountType type)
     {
-        ISC_STATUS stat[20];
-        char cnt_req[2], cnt_info[128];
+        unsigned char cnt_req[2], cnt_info[128];
 
         cnt_req[0]=isc_info_sql_records;
         cnt_req[1]=isc_info_end;
@@ -976,15 +1247,27 @@ namespace soci
         // It can extract number of rows returned by select statement,
         // but it appears that this is only number of rows prefetched by
         // client library, not total number of selected rows.
+        
+        auto & status = statementBackEnd->session_.status_;
+        try {
+            statementBackEnd->stmtp_->getInfo( &status, sizeof(cnt_req), cnt_req, sizeof(cnt_info), cnt_info );
+        }
+        catch (const Firebird::FbException& error)
+        {
+            char buf[1024];
+            statementBackEnd->session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+            throw firebird_soci_error( std::string(buf) );
+        }
+/*
         if (isc_dsql_sql_info(stat, &statementBackEnd->stmtp_, sizeof(cnt_req),
                               cnt_req, sizeof(cnt_info), cnt_info))
         {
             soci::details::firebird::throw_iscerror(stat);
         }
-
+*/
         long count = -1;
         char type_ = static_cast<char>(type);
-        for (char *ptr = cnt_info + 3; *ptr != isc_info_end;)
+        for (char *ptr = (char*)cnt_info + 3; *ptr != isc_info_end;)
         {
             char count_type = *ptr++;
             int m = isc_vax_integer(ptr, 2);
