@@ -22,7 +22,35 @@ firebird_statement_backend::firebird_statement_backend(firebird_session_backend 
       in_buffer_{nullptr}, out_buffer_{nullptr}, cursor_{nullptr},
         boundByName_(false), boundByPos_(false), rowsFetched_(0), endOfRowSet_(false), rowsAffectedBulk_(-1LL),
             intoType_(eStandard), useType_(eStandard), procedure_(false)
-{}
+{
+    session_.statements_.add( this );
+}
+
+firebird_statement_backend::~firebird_statement_backend()
+{
+    session_.statements_.erase( this );
+}
+
+void firebird_statement_backend::close_cursor()
+{
+    try
+    {
+        if( cursor_ ) {
+            cursor_->close( &session_.status_ );
+            cursor_ = nullptr;
+        }
+    }
+    catch (const FbException& error)
+    {
+        if( cursor_ ) {
+            cursor_->release();
+            cursor_ = nullptr;
+        }
+        char buf[1024];
+        session_.master_->getUtilInterface()->formatStatus(buf, sizeof(buf), error.getStatus());
+        throw firebird_soci_error( std::string(buf) );
+    }
+}
 
 void firebird_statement_backend::clean_up()
 {
@@ -38,7 +66,6 @@ void firebird_statement_backend::clean_up()
                 }
             };
 
-            _release( parent_->cursor_ );
             _release( parent_->stmtp_ );
             _release( parent_->in_meta_ );
             _release( parent_->out_meta_ );
@@ -49,14 +76,11 @@ void firebird_statement_backend::clean_up()
     };
 
     rowsAffectedBulk_ = -1LL;
+    close_cursor();
 
     Finalizer finalizer( this );
     try
     {
-        if( cursor_ ) {
-            cursor_->close( &session_.status_ );
-            cursor_ = nullptr;
-        }
         if( stmtp_ ) {
             stmtp_->free( &session_.status_ );
             stmtp_ = nullptr;
@@ -252,6 +276,8 @@ void firebird_statement_backend::prepare(std::string const & query,
 
     unsigned out_count = 0;
 
+    if( stmtp_ ) clean_up();
+
     try
     {
         stmtp_ = session_.dbhp_->prepare( &session_.status_, session_.current_transaction(), 0,
@@ -262,6 +288,7 @@ void firebird_statement_backend::prepare(std::string const & query,
         
         out_meta_ = stmtp_->getOutputMetadata(&session_.status_);
         out_buffer_ = new unsigned char[out_meta_->getMessageLength(&session_.status_)];
+
         out_count = out_meta_->getCount(&session_.status_);
     }
     catch (const FbException& error)
@@ -273,7 +300,7 @@ void firebird_statement_backend::prepare(std::string const & query,
 
     // prepare buffers for indicators
     inds_.clear();
-    inds_.resize( out_count /*sqldap_->sqld*/);
+    inds_.resize( out_count );
 
     // reset types of into buffers
     intoType_ = eStandard;
@@ -328,10 +355,7 @@ firebird_statement_backend::execute(int number)
             }
         }
 
-        if( cursor_ ) {
-            cursor_->close(&session_.status_);
-            cursor_ = nullptr;
-        }    
+        close_cursor();
 
         if (useType_ == eVector)
         {

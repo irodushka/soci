@@ -204,6 +204,7 @@ firebird_session_backend::firebird_session_backend(
                                          , prov_{master->getDispatcher()}
                                          , master_{master}
                                          , status_{master_->getStatus()}
+                                         , statements_{}
                                          , trhp_(nullptr)
                                          , decimals_as_strings_(false)
 {
@@ -420,6 +421,7 @@ void firebird_session_backend::commit()
         Finalizer finalizer( this );
         try
         {
+            statements_.closeCursorsAndBlobs();
             trhp_->commit(&status_);
             trhp_ = nullptr;
         }
@@ -450,6 +452,7 @@ void firebird_session_backend::rollback()
         Finalizer finalizer( this );
         try
         {
+            statements_.closeCursorsAndBlobs();
             trhp_->rollback(&status_);
             trhp_ = nullptr;
         }
