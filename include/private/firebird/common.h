@@ -29,19 +29,13 @@ namespace details
 namespace firebird
 {
 
-char * allocBuffer(XSQLVAR* var);
+void tmEncode(unsigned type, std::tm * src, void * dst);
 
-void tmEncode(short type, std::tm * src, void * dst);
+void tmDecode(unsigned type, void * src, std::tm * dst);
 
-void tmDecode(short type, void * src, std::tm * dst);
+void setTextParam(char const * s, std::size_t size, unsigned char * sqlbuf, unsigned sqltype, unsigned sqllen, int sqlscale);
 
-void setTextParam(char const * s, std::size_t size, char * buf_,
-    XSQLVAR * var);
-
-std::string getTextParam(XSQLVAR const *var);
-
-// Copy contents of a BLOB in buf into the given string.
-void copy_from_blob(firebird_statement_backend &st, char *buf, std::string &out);
+std::string getTextParam(unsigned char* sqlbuf, unsigned sqltype, unsigned sqllen, int sqlscale);
 
 template <typename IntType>
 const char *str2dec(const char * s, IntType &out, short &scale)
@@ -87,13 +81,13 @@ const char *str2dec(const char * s, IntType &out, short &scale)
 }
 
 template <typename T>
-inline
+SOCI_STATIC_INLINE
 T round_for_isc(T value)
 {
   return value;
 }
 
-inline
+SOCI_STATIC_INLINE
 double round_for_isc(double value)
 {
   // Unfortunately all the rounding functions are C99 and so are not supported
@@ -117,11 +111,11 @@ template<> struct cond_to_isc<true>
 };
 
 template<typename T1>
-void to_isc(void * val, XSQLVAR * var, short x_scale = 0)
+void to_isc(void * val, unsigned char* sqlbuf, unsigned sqltype, int sqlscale, short x_scale = 0)
 {
     T1 value = *reinterpret_cast<T1*>(val);
-    short scale = var->sqlscale + x_scale;
-    short type = var->sqltype & ~1;
+    short scale = sqlscale + x_scale;
+    auto type = sqltype;
     long long divisor = 1, multiplier = 1;
 
     cond_to_isc<std::numeric_limits<T1>::is_integer>::checkInteger(scale,type);
@@ -136,31 +130,31 @@ void to_isc(void * val, XSQLVAR * var, short x_scale = 0)
     case SQL_SHORT:
         {
             short tmp = static_cast<short>(round_for_isc(value*multiplier)/divisor);
-            std::memcpy(var->sqldata, &tmp, sizeof(short));
+            std::memcpy(sqlbuf, &tmp, sizeof(short));
         }
         break;
     case SQL_LONG:
         {
             int tmp = static_cast<int>(round_for_isc(value*multiplier)/divisor);
-            std::memcpy(var->sqldata, &tmp, sizeof(int));
+            std::memcpy(sqlbuf, &tmp, sizeof(int));
         }
         break;
     case SQL_INT64:
         {
             long long tmp = static_cast<long long>(round_for_isc(value*multiplier)/divisor);
-            std::memcpy(var->sqldata, &tmp, sizeof(long long));
+            std::memcpy(sqlbuf, &tmp, sizeof(long long));
         }
         break;
     case SQL_FLOAT:
         {
             float sql_value = static_cast<float>(value);
-            std::memcpy(var->sqldata, &sql_value, sizeof(float));
+            std::memcpy(sqlbuf, &sql_value, sizeof(float));
         }
         break;
     case SQL_DOUBLE:
         {
             double sql_value = static_cast<double>(value);
-            std::memcpy(var->sqldata, &sql_value, sizeof(double));
+            std::memcpy(sqlbuf, &sql_value, sizeof(double));
         }
         break;
     default:
@@ -169,18 +163,19 @@ void to_isc(void * val, XSQLVAR * var, short x_scale = 0)
 }
 
 template<typename IntType, typename UIntType>
-void parse_decimal(void * val, XSQLVAR * var, const char * s)
+void parse_decimal(int sqlscale, unsigned sqltype, unsigned char* sqlbuf, const char * s)
 {
     short scale;
     UIntType t1;
     IntType t2;
-    if (!*str2dec(s, t1, scale))
-        std::memcpy(val, &t1, sizeof(t1));
-    else if (!*str2dec(s, t2, scale))
-        std::memcpy(val, &t2, sizeof(t2));
+    if (!*str2dec(s, t1, scale)) {
+        to_isc<IntType>((void*)&t1, sqlbuf, sqltype, sqlscale, scale);
+    }    
+    else if (!*str2dec(s, t2, scale)) {
+        to_isc<IntType>((void*)&t2, sqlbuf, sqltype, sqlscale, scale);
+    }    
     else
         throw soci_error("Could not parse decimal value.");
-    to_isc<IntType>(val, var, scale);
 }
 
 template<typename IntType>
@@ -221,9 +216,9 @@ template<> struct cond_from_isc<false>
 };
 
 template<typename T1>
-T1 from_isc(XSQLVAR * var)
+T1 from_isc(unsigned char* sqlbuf, unsigned sqltype, int sqlscale)
 {
-    short scale = var->sqlscale;
+    short scale = sqlscale;
     T1 tens = 1;
 
     if (scale < 0)
@@ -237,23 +232,39 @@ T1 from_isc(XSQLVAR * var)
 
     GCC_WARNING_SUPPRESS(cast-align)
 
-    switch (var->sqltype & ~1)
+    switch (sqltype)
     {
     case SQL_SHORT:
-        return static_cast<T1>(*reinterpret_cast<short*>(var->sqldata)/tens);
+        return static_cast<T1>(*reinterpret_cast<short*>(sqlbuf)/tens);
     case SQL_LONG:
-        return static_cast<T1>(*reinterpret_cast<int*>(var->sqldata)/tens);
+        return static_cast<T1>(*reinterpret_cast<int*>(sqlbuf)/tens);
     case SQL_INT64:
-        return static_cast<T1>(*reinterpret_cast<long long*>(var->sqldata)/tens);
+        return static_cast<T1>(*reinterpret_cast<long long*>(sqlbuf)/tens);
     case SQL_FLOAT:
-        return static_cast<T1>(*reinterpret_cast<float*>(var->sqldata));
+        return static_cast<T1>(*reinterpret_cast<float*>(sqlbuf));
     case SQL_DOUBLE:
-        return static_cast<T1>(*reinterpret_cast<double*>(var->sqldata));
+        return static_cast<T1>(*reinterpret_cast<double*>(sqlbuf));
     default:
         throw soci_error("Incorrect data type for numeric conversion");
     }
 
     GCC_WARNING_RESTORE(cast-align)
+}
+
+template <typename T>
+SOCI_STATIC_INLINE
+std::size_t getVectorSize(void *p)
+{
+    std::vector<T> *v = static_cast<std::vector<T> *>(p);
+    return v->size();
+}
+
+template <typename T>
+SOCI_STATIC_INLINE
+void resizeVector(void *p, std::size_t sz)
+{
+    std::vector<T> *v = static_cast<std::vector<T> *>(p);
+    v->resize(sz);
 }
 
 } // namespace firebird
